@@ -180,20 +180,37 @@ to allocate a new frame — restoring isolation automatically.
 ---
 
 ## Building
-
 ```bash
-# Inside the kernel source tree
-cd ~/linux
-git checkout assignment2
+# Clone the stable kernel
+git clone --depth=1 --branch v6.19.3 \
+  https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+cd linux
 
-# Disable huge pages (required)
+# Apply the assignment patch
+git apply assignment2_final.patch
+
+# Verify patch applied cleanly
+git diff --stat HEAD
+
+# Disable huge pages (required by assignment)
 scripts/config --disable CONFIG_TRANSPARENT_HUGEPAGE
 
-# Build
+# Copy your current kernel config as base
+cp /boot/config-$(uname -r) .config
+make olddefconfig ARCH=arm64
+
+# Build (takes 30–60 min on ARM64 VM)
 make ARCH=arm64 -j$(nproc)
 sudo make modules_install ARCH=arm64
 sudo make install ARCH=arm64
 sudo reboot
+```
+
+If git apply fails (due to whitespace or line ending issues), you can try
+```bash
+git apply --whitespace=fix assignment2_final.patch
+# or
+patch -p1 < assignment2_final.patch
 ```
 
 ---
