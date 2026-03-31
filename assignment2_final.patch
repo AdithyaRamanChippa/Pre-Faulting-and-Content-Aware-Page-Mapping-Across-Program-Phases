@@ -1,0 +1,483 @@
+diff --git a/include/linux/phase_map.h b/include/linux/phase_map.h
+new file mode 100644
+index 000000000..d04f919f2
+--- /dev/null
++++ b/include/linux/phase_map.h
+@@ -0,0 +1,21 @@
++#ifndef _LINUX_PHASE_MAP_H
++#define _LINUX_PHASE_MAP_H
++
++#include <linux/types.h>
++#include <linux/mm_types.h>
++
++struct phase_map_info {
++    unsigned long  buff1_start;
++    unsigned long  buff2_start;
++    size_t         len;
++    unsigned long  num_pages;
++    unsigned long *accessed_bitmap;
++};
++
++extern struct phase_map_info *phase_info;
++
++void phase_map_mirror_page(struct vm_area_struct *vma,
++                           unsigned long fault_addr,
++                           struct page *page);
++#endif
++
+diff --git a/kernel/Makefile b/kernel/Makefile
+index e83669841..6cc87a3f0 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -12,6 +12,7 @@ obj-y     = fork.o exec_domain.o panic.o \
+ 	    notifier.o ksysfs.o cred.o reboot.o \
+ 	    async.o range.o smpboot.o ucount.o regset.o ksyms_common.o
+ 
++obj-y += phase_map.o
+ obj-$(CONFIG_MULTIUSER) += groups.o
+ obj-$(CONFIG_VHOST_TASK) += vhost_task.o
+ 
+diff --git a/kernel/phase_map.c b/kernel/phase_map.c
+new file mode 100644
+index 000000000..ae26ab415
+--- /dev/null
++++ b/kernel/phase_map.c
+@@ -0,0 +1,368 @@
++#include <linux/kernel.h>
++#include <linux/syscalls.h>
++#include <linux/slab.h>
++#include <linux/mm.h>
++#include <linux/mm_types.h>
++#include <linux/pgtable.h>
++#include <linux/rmap.h>
++#include <linux/phase_map.h>
++#include <asm/pgtable.h>
++
++struct phase_map_info *phase_info = NULL;
++
++static void install_ro_pte(struct mm_struct *mm,
++                           unsigned long addr,
++                           pte_t *ptep,
++                           struct page *page,
++                           struct vm_area_struct *vma)
++{
++    pte_t entry;
++
++    entry = mk_pte(page, vma->vm_page_prot);
++    entry = clear_pte_bit(entry, __pgprot(PTE_DIRTY));
++    entry = clear_pte_bit(entry, __pgprot(PTE_DBM));
++    entry = pte_wrprotect(entry);
++
++    set_pte_at(mm, addr, ptep, entry);
++    flush_tlb_range(vma, addr, addr + PAGE_SIZE);
++}
++
++static void wrprotect_existing_pte(struct mm_struct *mm,
++                                   unsigned long addr,
++                                   pte_t *ptep,
++                                   struct vm_area_struct *vma)
++{
++    pte_t old = ptep_get(ptep);
++    pte_t new;
++    struct page *pg = pte_page(old);
++
++    new = pte_wrprotect(old);
++    new = clear_pte_bit(new, __pgprot(PTE_DIRTY));
++    new = clear_pte_bit(new, __pgprot(PTE_DBM));
++
++    ptep_modify_prot_commit(vma, addr, ptep, old, new);
++    flush_tlb_range(vma, addr, addr + PAGE_SIZE);
++
++    ClearPageAnonExclusive(pg);
++
++    printk(KERN_INFO "phase_map: wrprotect addr=%lx exclusive=%d\n",
++           addr, PageAnonExclusive(pg));
++}
++
++static struct page *phase_get_locked_pte(struct mm_struct *mm,
++                                   unsigned long addr,
++                                   pte_t **ptep_out,
++                                   spinlock_t **ptl_out)
++{
++    pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *pte;
++    spinlock_t *ptl;
++
++    pgd = pgd_offset(mm, addr);
++    if (pgd_none(*pgd)) return NULL;
++    p4d = p4d_offset(pgd, addr);
++    if (p4d_none(*p4d)) return NULL;
++    pud = pud_offset(p4d, addr);
++    if (pud_none(*pud)) return NULL;
++    pmd = pmd_offset(pud, addr);
++    if (pmd_none(*pmd)) return NULL;
++
++    pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
++    if (!pte || pte_none(*pte)) {
++        if (pte) pte_unmap_unlock(pte, ptl);
++        return NULL;
++    }
++
++    *ptep_out = pte;
++    *ptl_out  = ptl;
++    return pte_page(*pte);
++}
++
++static pte_t *get_or_alloc_pte_slot(struct mm_struct *mm,
++                                    unsigned long addr,
++                                    spinlock_t **ptl_out)
++{
++    pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd;
++
++    pgd = pgd_offset(mm, addr);
++    p4d = p4d_alloc(mm, pgd, addr);
++    if (!p4d) return NULL;
++    pud = pud_alloc(mm, p4d, addr);
++    if (!pud) return NULL;
++    pmd = pmd_alloc(mm, pud, addr);
++    if (!pmd) return NULL;
++
++    return pte_alloc_map_lock(mm, pmd, addr, ptl_out);
++}
++
++SYSCALL_DEFINE4(map_phase, void __user *, buff1,
++                void __user *, buff2,
++                size_t, len,
++                int, flags)
++{
++    printk(KERN_INFO "map_phase syscall invoked\n");
++
++    if (!access_ok(buff1, len) || !access_ok(buff2, len))
++        return -EFAULT;
++
++    if (phase_info) {
++        kfree(phase_info->accessed_bitmap);
++        kfree(phase_info);
++        phase_info = NULL;
++    }
++
++    phase_info = kzalloc(sizeof(struct phase_map_info), GFP_KERNEL);
++    if (!phase_info)
++        return -ENOMEM;
++
++    phase_info->buff1_start = (unsigned long)buff1;
++    phase_info->buff2_start = (unsigned long)buff2;
++    phase_info->len         = len;
++    phase_info->num_pages   = len >> PAGE_SHIFT;
++
++    phase_info->accessed_bitmap =
++        kzalloc(BITS_TO_LONGS(phase_info->num_pages) * sizeof(long),
++                GFP_KERNEL);
++    if (!phase_info->accessed_bitmap) {
++        kfree(phase_info);
++        phase_info = NULL;
++        return -ENOMEM;
++    }
++
++    printk(KERN_INFO "phase_map: registered buff1=%lx buff2=%lx pages=%lu\n",
++           phase_info->buff1_start,
++           phase_info->buff2_start,
++           phase_info->num_pages);
++    return 0;
++}
++
++void phase_map_mirror_page(struct vm_area_struct *vma,
++                           unsigned long fault_addr,
++                           struct page *page)
++{
++    unsigned long offset, page_idx;
++
++    if (!phase_info)
++        return;
++    if (vma->vm_mm != current->mm)
++        return;
++    if (fault_addr < phase_info->buff1_start ||
++        fault_addr >= phase_info->buff1_start + phase_info->len)
++        return;
++
++    offset   = fault_addr - phase_info->buff1_start;
++    page_idx = offset >> PAGE_SHIFT;
++
++    set_bit(page_idx, phase_info->accessed_bitmap);
++
++    printk(KERN_INFO "phase_map: recorded page %lu\n", page_idx);
++}
++
++SYSCALL_DEFINE4(dedup_pages, void __user *, buff1,
++                void __user *, buff2,
++                size_t, len,
++                int, flags)
++{
++    unsigned long i, j;
++    struct mm_struct *mm = current->mm;
++    struct page *page1, *page2;
++    pte_t *ptep1, *ptep2;
++    spinlock_t *ptl1, *ptl2;
++    void *kaddr1, *kaddr2;
++    struct vm_area_struct *vma1, *vma2;
++
++    printk(KERN_INFO "dedup_pages syscall invoked\n");
++
++    if (!phase_info)
++        return -EINVAL;
++
++    mmap_read_lock(mm);
++
++    printk(KERN_INFO "phase_map: Step A — pre-mapping buff2\n");
++
++    for (i = 0; i < phase_info->num_pages; i++) {
++        unsigned long b1_addr = phase_info->buff1_start + (i << PAGE_SHIFT);
++        unsigned long b2_addr = phase_info->buff2_start + (i << PAGE_SHIFT);
++
++        if (!test_bit(i, phase_info->accessed_bitmap))
++            continue;
++
++        vma1 = find_vma(mm, b1_addr);
++        vma2 = find_vma(mm, b2_addr);
++        if (!vma1 || !vma2) continue;
++
++        page1 = phase_get_locked_pte(mm, b1_addr, &ptep1, &ptl1);
++        if (!page1) continue;
++        pte_unmap_unlock(ptep1, ptl1);
++
++        page2 = phase_get_locked_pte(mm, b2_addr, &ptep2, &ptl2);
++        if (page2) pte_unmap_unlock(ptep2, ptl2);
++
++        flush_dcache_page(page1);
++
++        {
++            pgd_t *g = pgd_offset(mm, b1_addr);
++            p4d_t *f4 = p4d_offset(g, b1_addr);
++            pud_t *u = pud_offset(f4, b1_addr);
++            pmd_t *m = pmd_offset(u, b1_addr);
++            ptep1 = pte_offset_map_lock(mm, m, b1_addr, &ptl1);
++            if (ptep1) {
++                wrprotect_existing_pte(mm, b1_addr, ptep1, vma1);
++                pte_unmap_unlock(ptep1, ptl1);
++            }
++        }
++
++        {
++            pte_t *dst_pte;
++            spinlock_t *dst_ptl;
++
++            dst_pte = get_or_alloc_pte_slot(mm, b2_addr, &dst_ptl);
++            if (!dst_pte) continue;
++
++            get_page(page1);
++            ClearPageAnonExclusive(page1);
++
++            if (page2 && page2 != page1)
++                put_page(page2);
++
++            install_ro_pte(mm, b2_addr, dst_pte, page1, vma2);
++            folio_add_anon_rmap_pte(page_folio(page1), page1,
++                                    vma2, b2_addr, RMAP_NONE);
++            pte_unmap_unlock(dst_pte, dst_ptl);
++
++            printk(KERN_INFO "phase_map: pre-mapped buff2[%lu]\n", i);
++        }
++    }
++
++    printk(KERN_INFO "phase_map: Step B — intra-buffer dedup\n");
++
++    for (i = 0; i < phase_info->num_pages; i++) {
++        unsigned long ai = phase_info->buff1_start + (i << PAGE_SHIFT);
++
++        page1 = phase_get_locked_pte(mm, ai, &ptep1, &ptl1);
++        if (!page1) continue;
++        pte_unmap_unlock(ptep1, ptl1);
++
++        kaddr1 = kmap_local_page(page1);
++
++        for (j = i + 1; j < phase_info->num_pages; j++) {
++            unsigned long aj = phase_info->buff1_start + (j << PAGE_SHIFT);
++
++            page2 = phase_get_locked_pte(mm, aj, &ptep2, &ptl2);
++            if (!page2) continue;
++            pte_unmap_unlock(ptep2, ptl2);
++
++            if (page1 == page2) continue;
++
++            kaddr2 = kmap_local_page(page2);
++            if (memcmp(kaddr1, kaddr2, PAGE_SIZE) == 0) {
++                kunmap_local(kaddr2);
++
++                vma1 = find_vma(mm, ai);
++                vma2 = find_vma(mm, aj);
++                if (!vma1 || !vma2) continue;
++
++                flush_dcache_page(page1);
++                printk(KERN_INFO "phase_map: intra-dedup buff1[%lu]=buff1[%lu]\n", i, j);
++
++                {
++                    pgd_t *g = pgd_offset(mm, ai);
++                    p4d_t *f4 = p4d_offset(g, ai);
++                    pud_t *u = pud_offset(f4, ai);
++                    pmd_t *m = pmd_offset(u, ai);
++                    pte_t *tp; spinlock_t *tl;
++                    tp = pte_offset_map_lock(mm, m, ai, &tl);
++                    if (tp) {
++                        wrprotect_existing_pte(mm, ai, tp, vma1);
++                        pte_unmap_unlock(tp, tl);
++                    }
++                }
++
++                {
++                    pgd_t *g = pgd_offset(mm, aj);
++                    p4d_t *f4 = p4d_offset(g, aj);
++                    pud_t *u = pud_offset(f4, aj);
++                    pmd_t *m = pmd_offset(u, aj);
++                    pte_t *tp; spinlock_t *tl;
++                    tp = pte_offset_map_lock(mm, m, aj, &tl);
++                    if (tp) {
++                        get_page(page1);
++                        ClearPageAnonExclusive(page1);
++                        put_page(page2);
++                        install_ro_pte(mm, aj, tp, page1, vma2);
++                        folio_add_anon_rmap_pte(page_folio(page1), page1,
++                                                vma2, aj, RMAP_NONE);
++                        pte_unmap_unlock(tp, tl);
++                    }
++                }
++            } else {
++                kunmap_local(kaddr2);
++            }
++        }
++        kunmap_local(kaddr1);
++    }
++
++    printk(KERN_INFO "phase_map: Step C — cross-buffer dedup\n");
++
++    for (i = 0; i < phase_info->num_pages; i++) {
++        unsigned long b1_addr = phase_info->buff1_start + (i << PAGE_SHIFT);
++        unsigned long b2_addr = phase_info->buff2_start + (i << PAGE_SHIFT);
++
++        page1 = phase_get_locked_pte(mm, b1_addr, &ptep1, &ptl1);
++        if (!page1) continue;
++        pte_unmap_unlock(ptep1, ptl1);
++
++        page2 = phase_get_locked_pte(mm, b2_addr, &ptep2, &ptl2);
++        if (!page2) continue;
++        pte_unmap_unlock(ptep2, ptl2);
++
++        if (page1 == page2) continue;
++
++        kaddr1 = kmap_local_page(page1);
++        kaddr2 = kmap_local_page(page2);
++        if (memcmp(kaddr1, kaddr2, PAGE_SIZE) != 0) {
++            kunmap_local(kaddr2);
++            kunmap_local(kaddr1);
++            continue;
++        }
++        kunmap_local(kaddr2);
++        kunmap_local(kaddr1);
++
++        vma2 = find_vma(mm, b2_addr);
++        if (!vma2) continue;
++
++        flush_dcache_page(page1);
++        printk(KERN_INFO "phase_map: cross-dedup buff1[%lu]=buff2[%lu]\n", i, i);
++
++        {
++            pgd_t *g = pgd_offset(mm, b2_addr);
++            p4d_t *f4 = p4d_offset(g, b2_addr);
++            pud_t *u = pud_offset(f4, b2_addr);
++            pmd_t *m = pmd_offset(u, b2_addr);
++            pte_t *tp; spinlock_t *tl;
++            tp = pte_offset_map_lock(mm, m, b2_addr, &tl);
++            if (tp) {
++                get_page(page1);
++                ClearPageAnonExclusive(page1);
++                put_page(page2);
++                install_ro_pte(mm, b2_addr, tp, page1, vma2);
++                folio_add_anon_rmap_pte(page_folio(page1), page1,
++                                        vma2, b2_addr, RMAP_NONE);
++                pte_unmap_unlock(tp, tl);
++            }
++        }
++    }
++
++    mmap_read_unlock(mm);
++
++    printk(KERN_INFO "phase_map: accessed pages: ");
++    for (i = 0; i < phase_info->num_pages; i++)
++        if (test_bit(i, phase_info->accessed_bitmap))
++            printk(KERN_CONT "%lu ", i);
++    printk(KERN_CONT "\n");
++
++    kfree(phase_info->accessed_bitmap);
++    kfree(phase_info);
++    phase_info = NULL;
++
++    return 0;
++}
+diff --git a/mm/memory.c b/mm/memory.c
+index da360a6eb..193229075 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -38,7 +38,7 @@
+  *
+  * Aug/Sep 2004 Changed to four level page tables (Andi Kleen)
+  */
+-
++#include <linux/phase_map.h>
+ #include <linux/kernel_stat.h>
+ #include <linux/mm.h>
+ #include <linux/mm_inline.h>
+@@ -78,7 +78,6 @@
+ #include <linux/sched/sysctl.h>
+ #include <linux/pgalloc.h>
+ #include <linux/uaccess.h>
+-
+ #include <trace/events/kmem.h>
+ 
+ #include <asm/io.h>
+@@ -5242,7 +5241,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 	entry = pte_sw_mkyoung(entry);
+ 	if (vma->vm_flags & VM_WRITE)
+ 		entry = pte_mkwrite(pte_mkdirty(entry), vma);
+-
++	
+ 	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, addr, &vmf->ptl);
+ 	if (!vmf->pte)
+ 		goto release;
+@@ -5270,6 +5269,8 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 	count_mthp_stat(folio_order(folio), MTHP_STAT_ANON_FAULT_ALLOC);
+ 	folio_add_new_anon_rmap(folio, vma, addr, RMAP_EXCLUSIVE);
+ 	folio_add_lru_vma(folio, vma);
++
++
+ setpte:
+ 	if (vmf_orig_pte_uffd_wp(vmf))
+ 		entry = pte_mkuffd_wp(entry);
+@@ -5277,6 +5278,15 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 
+ 	/* No need to invalidate - it was non-present before */
+ 	update_mmu_cache_range(vmf, vma, addr, vmf->pte, nr_pages);
++	
++	pte_unmap_unlock(vmf->pte, vmf->ptl);
++        vmf->pte = NULL;   /* tell unlock: label not to unlock again */
++        
++         if (folio && !folio_test_large(folio))
++                phase_map_mirror_page(vma, vmf->address, folio_page(folio, 0));
++
++        
++        return ret;
+ unlock:
+ 	if (vmf->pte)
+ 		pte_unmap_unlock(vmf->pte, vmf->ptl);
+@@ -7402,3 +7412,4 @@ void vma_pgtable_walk_end(struct vm_area_struct *vma)
+ 	if (is_vm_hugetlb_page(vma))
+ 		hugetlb_vma_unlock_read(vma);
+ }
++
+diff --git a/scripts/syscall.tbl b/scripts/syscall.tbl
+index e74868be5..37134fbdf 100644
+--- a/scripts/syscall.tbl
++++ b/scripts/syscall.tbl
+@@ -411,3 +411,5 @@
+ 468	common	file_getattr			sys_file_getattr
+ 469	common	file_setattr			sys_file_setattr
+ 470	common	listns				sys_listns
++471      common  map_phase      sys_map_phase
++472      common  dedup_pages    sys_dedup_pages
